@@ -1,162 +1,141 @@
 # MCP System Analysis and Documentation
 
-## 1. Configuration Layer Review
-[Previous content remains the same...]
+[Previous sections remain the same...]
 
-## 2. API Handler Analysis
+## 3. Circuit Breaker Analysis (Continued)
 
-### 2.1 core/api_handler.py Review
-File Location: `/core/api_handler.py`
-
-Current Implementation Issues:
-1. No connection pooling for container environment
-2. Missing health checks
-3. No container-aware retry mechanism
-4. Missing circuit breaker for containerized services
-
-Required Changes:
-```python
-from typing import Dict, Any, Optional
-from aiohttp import ClientSession, TCPConnector
-from core.circuit_breaker import CircuitBreaker
-from utils.monitoring import PerformanceMonitor
-
-class APIHandler:
-    def __init__(self, config: Config):
-        self.config = config
-        self.session: Optional[ClientSession] = None
-        self.circuit_breaker = CircuitBreaker(
-            failure_threshold=5,
-            recovery_timeout=30
-        )
-        self.monitor = PerformanceMonitor()
-        self.connector = TCPConnector(
-            limit=100,              # Connection pool limit
-            limit_per_host=20,      # Per host limit
-            enable_cleanup_closed=True,
-            force_close=False
-        )
-
-    async def initialize(self) -> None:
-        """Initialize API handler with connection pool"""
-        if not self.session:
-            self.session = ClientSession(
-                connector=self.connector,
-                timeout=self.config.REQUEST_TIMEOUT
-            )
-
-    async def request(
-        self,
-        method: str,
-        endpoint: str,
-        service: str,
-        **kwargs
-    ) -> Dict[str, Any]:
-        """Make API request with circuit breaker and monitoring"""
-        await self.circuit_breaker.check_state(service)
-
-        try:
-            async with self.monitor.measure(f'api_request_{service}'):
-                async with self.session.request(
-                    method,
-                    endpoint,
-                    **kwargs
-                ) as response:
-                    if response.status >= 400:
-                        await self.circuit_breaker.record_failure(service)
-                        raise APIError(
-                            f'API error: {response.status}'
-                        )
-                    return await response.json()
-
-        except Exception as e:
-            await self.circuit_breaker.record_failure(service)
-            self.monitor.record_metric(
-                'api_errors',
-                1,
-                {'service': service}
-            )
-            raise
-
-    async def health_check(self) -> bool:
-        """Check API handler health"""
-        try:
-            # Check session
-            if not self.session or self.session.closed:
-                await self.initialize()
-
-            # Check connection pool
-            if self.connector.closed:
-                return False
-
-            # Check active connections
-            active_connections = len(self.connector._acquired)
-            max_connections = self.connector._limit
-
-            # Report metrics
-            self.monitor.record_metric(
-                'connection_pool_usage',
-                active_connections / max_connections
-            )
-
-            return True
-
-        except Exception as e:
-            self.monitor.record_metric('health_check_errors', 1)
-            return False
+### 3.1 State Management Flow:
 ```
-
-Function Chain Analysis:
-
-1. Request Flow:
-```
-Client Request
-    → APIHandler.request()
-        → CircuitBreaker.check_state()
-            → HTTP Request
-                → Response Processing
-                    → Metric Recording
-```
-
-2. Health Check Flow:
-```
-Health Check Request
-    → APIHandler.health_check()
-        → Connection Validation
-            → Pool Status Check
+Service Request
+    → check_state()
+        → _get_state()
+            → State Transition Logic
                 → Metric Recording
 ```
 
-3. Error Handling Flow:
+### 3.2 Failure Handling Flow:
 ```
-Error Occurs
-    → Circuit Breaker Update
-        → Metric Recording
-            → Error Propagation
+Service Failure
+    → record_failure()
+        → Update Failure Count
+            → Check Threshold
+                → _transition_to_open()
+                    → Metric Recording
 ```
 
-Container-Specific Considerations:
-1. Connection Pool Management:
-   - Pool size based on container resources
-   - Connection cleanup on container shutdown
-   - Health check integration with container orchestration
+### 3.3 Recovery Flow:
+```
+Closed Circuit
+    → Normal Operation
+        → Failures Exceed Threshold
+            → Open Circuit
+                → Wait Recovery Timeout
+                    → Half-Open Circuit
+                        → Successful Requests
+                            → Closed Circuit
+```
 
-2. Resource Management:
-   - Memory-aware connection limits
-   - CPU-aware request throttling
-   - Container-aware circuit breaker thresholds
+### 3.4 Container-Specific Considerations:
+
+1. State Persistence:
+```python
+class CircuitBreakerStorage:
+    async def save_state(self, service: str, state: CircuitState):
+        """Save circuit state to Redis"""
+        async with self.redis.get() as redis:
+            await redis.hset(
+                'circuit_breaker_states',
+                service,
+                state.value
+            )
+
+    async def load_state(self, service: str) -> Optional[CircuitState]:
+        """Load circuit state from Redis"""
+        async with self.redis.get() as redis:
+            state = await redis.hget(
+                'circuit_breaker_states',
+                service
+            )
+            return CircuitState(state) if state else None
+```
+
+2. Container Health Integration:
+```python
+class CircuitBreakerHealth:
+    async def check_health(self) -> Dict[str, Any]:
+        """Check circuit breaker health status"""
+        return {
+            'status': 'healthy',
+            'metrics': await self.get_metrics(),
+            'open_circuits': [
+                service for service, state in self.state.items()
+                if state == CircuitState.OPEN
+            ]
+        }
+```
+
+3. Multi-Container Synchronization:
+```python
+class CircuitBreakerSync:
+    async def broadcast_state_change(self, service: str, state: CircuitState):
+        """Broadcast state change to other containers"""
+        message = {
+            'service': service,
+            'state': state.value,
+            'timestamp': datetime.now().isoformat()
+        }
+        await self.redis.publish('circuit_breaker_updates', json.dumps(message))
+```
+
+### 3.5 Implementation Requirements:
+
+1. Configuration Updates:
+```python
+# Add to config.py
+class CircuitBreakerConfig:
+    FAILURE_THRESHOLD = int(os.getenv('CB_FAILURE_THRESHOLD', '5'))
+    RECOVERY_TIMEOUT = int(os.getenv('CB_RECOVERY_TIMEOUT', '30'))
+    HALF_OPEN_LIMIT = int(os.getenv('CB_HALF_OPEN_LIMIT', '3'))
+    STATE_SYNC_ENABLED = bool(os.getenv('CB_STATE_SYNC', 'true'))
+```
+
+2. Docker Compose Updates:
+```yaml
+# Add to docker-compose.yml
+services:
+  mcp-app:
+    environment:
+      - CB_FAILURE_THRESHOLD=5
+      - CB_RECOVERY_TIMEOUT=30
+      - CB_HALF_OPEN_LIMIT=3
+      - CB_STATE_SYNC=true
+```
 
 3. Monitoring Integration:
-   - Prometheus metrics export
-   - Container health status
-   - Resource utilization tracking
+```python
+# Add to prometheus.yml
+scrape_configs:
+  - job_name: 'circuit_breaker'
+    metrics_path: '/metrics/circuit_breaker'
+    static_configs:
+      - targets: ['mcp-app:8000']
+```
 
-Next Files to Review:
-1. core/circuit_breaker.py
-2. core/data_processor.py
-3. utils/monitoring.py
+### 3.6 Critical Paths:
 
-Updates Needed:
-1. Implement circuit breaker with container awareness
-2. Add container shutdown hooks
-3. Enhance health check mechanism
+1. State Transitions:
+   - Must be atomic across containers
+   - Requires distributed locking
+   - Needs failure recovery
+
+2. Metric Collection:
+   - Real-time monitoring
+   - Historical tracking
+   - Alert thresholds
+
+3. Health Checks:
+   - Component status
+   - Resource usage
+   - Error rates
+
+Next Component to Review: Data Processor (core/data_processor.py)
