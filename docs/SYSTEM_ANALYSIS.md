@@ -1,96 +1,162 @@
 # MCP System Analysis and Documentation
 
 ## 1. Configuration Layer Review
+[Previous content remains the same...]
 
-### 1.1 config.py Analysis
-File Location: `/config.py`
+## 2. API Handler Analysis
 
-Current Implementation:
-```python
-class Config:
-    COINGECKO_API_KEY = os.getenv('COINGECKO_API_KEY')
-    COINMARKETCAP_API_KEY = os.getenv('COINMARKETCAP_API_KEY')
-```
+### 2.1 core/api_handler.py Review
+File Location: `/core/api_handler.py`
 
-Docker Compatibility Issues:
-1. No default values for container environment
-2. Missing container-specific configurations
-3. No validation for required environment variables
+Current Implementation Issues:
+1. No connection pooling for container environment
+2. Missing health checks
+3. No container-aware retry mechanism
+4. Missing circuit breaker for containerized services
 
 Required Changes:
 ```python
-from typing import Dict, Any
-import os
+from typing import Dict, Any, Optional
+from aiohttp import ClientSession, TCPConnector
+from core.circuit_breaker import CircuitBreaker
+from utils.monitoring import PerformanceMonitor
 
-class Config:
-    # Database Configuration
-    POSTGRES_HOST = os.getenv('POSTGRES_HOST', 'postgres')
-    POSTGRES_PORT = int(os.getenv('POSTGRES_PORT', '5432'))
-    POSTGRES_USER = os.getenv('POSTGRES_USER', 'mcp')
-    POSTGRES_PASSWORD = os.getenv('POSTGRES_PASSWORD', 'mcp')
-    POSTGRES_DB = os.getenv('POSTGRES_DB', 'mcp')
+class APIHandler:
+    def __init__(self, config: Config):
+        self.config = config
+        self.session: Optional[ClientSession] = None
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=5,
+            recovery_timeout=30
+        )
+        self.monitor = PerformanceMonitor()
+        self.connector = TCPConnector(
+            limit=100,              # Connection pool limit
+            limit_per_host=20,      # Per host limit
+            enable_cleanup_closed=True,
+            force_close=False
+        )
 
-    # Redis Configuration
-    REDIS_HOST = os.getenv('REDIS_HOST', 'redis')
-    REDIS_PORT = int(os.getenv('REDIS_PORT', '6379'))
-    REDIS_DB = int(os.getenv('REDIS_DB', '0'))
+    async def initialize(self) -> None:
+        """Initialize API handler with connection pool"""
+        if not self.session:
+            self.session = ClientSession(
+                connector=self.connector,
+                timeout=self.config.REQUEST_TIMEOUT
+            )
 
-    # API Keys
-    COINGECKO_API_KEY = os.getenv('COINGECKO_API_KEY')
-    COINMARKETCAP_API_KEY = os.getenv('COINMARKETCAP_API_KEY')
-    CLAUDE_API_KEY = os.getenv('CLAUDE_API_KEY')
+    async def request(
+        self,
+        method: str,
+        endpoint: str,
+        service: str,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Make API request with circuit breaker and monitoring"""
+        await self.circuit_breaker.check_state(service)
 
-    # Service Configuration
-    SERVICE_PORT = int(os.getenv('SERVICE_PORT', '8000'))
-    SERVICE_HOST = os.getenv('SERVICE_HOST', '0.0.0.0')
+        try:
+            async with self.monitor.measure(f'api_request_{service}'):
+                async with self.session.request(
+                    method,
+                    endpoint,
+                    **kwargs
+                ) as response:
+                    if response.status >= 400:
+                        await self.circuit_breaker.record_failure(service)
+                        raise APIError(
+                            f'API error: {response.status}'
+                        )
+                    return await response.json()
 
-    # Monitoring
-    PROMETHEUS_PORT = int(os.getenv('PROMETHEUS_PORT', '9090'))
-    GRAFANA_PORT = int(os.getenv('GRAFANA_PORT', '3000'))
+        except Exception as e:
+            await self.circuit_breaker.record_failure(service)
+            self.monitor.record_metric(
+                'api_errors',
+                1,
+                {'service': service}
+            )
+            raise
 
-    @classmethod
-    def get_postgres_url(cls) -> str:
-        return f'postgresql://{cls.POSTGRES_USER}:{cls.POSTGRES_PASSWORD}@{cls.POSTGRES_HOST}:{cls.POSTGRES_PORT}/{cls.POSTGRES_DB}'
+    async def health_check(self) -> bool:
+        """Check API handler health"""
+        try:
+            # Check session
+            if not self.session or self.session.closed:
+                await self.initialize()
 
-    @classmethod
-    def get_redis_url(cls) -> str:
-        return f'redis://{cls.REDIS_HOST}:{cls.REDIS_PORT}/{cls.REDIS_DB}'
+            # Check connection pool
+            if self.connector.closed:
+                return False
 
-    @classmethod
-    def validate(cls) -> None:
-        required_vars = [
-            'CLAUDE_API_KEY',
-            'POSTGRES_PASSWORD',
-            'REDIS_HOST'
-        ]
-        missing = [var for var in required_vars if not getattr(cls, var)]
-        if missing:
-            raise ValueError(f'Missing required configuration: {missing}')
+            # Check active connections
+            active_connections = len(self.connector._acquired)
+            max_connections = self.connector._limit
+
+            # Report metrics
+            self.monitor.record_metric(
+                'connection_pool_usage',
+                active_connections / max_connections
+            )
+
+            return True
+
+        except Exception as e:
+            self.monitor.record_metric('health_check_errors', 1)
+            return False
 ```
 
 Function Chain Analysis:
-1. Configuration Loading:
-   ```
-   Environment Variables → Config Class → Service Configuration
-   ```
 
-2. URL Generation:
-   ```
-   Config Class → get_postgres_url() → Database Connection
-   Config Class → get_redis_url() → Cache Connection
-   ```
+1. Request Flow:
+```
+Client Request
+    → APIHandler.request()
+        → CircuitBreaker.check_state()
+            → HTTP Request
+                → Response Processing
+                    → Metric Recording
+```
 
-3. Validation Flow:
-   ```
-   Service Start → Config.validate() → Check Required Variables → Service Initialization
-   ```
+2. Health Check Flow:
+```
+Health Check Request
+    → APIHandler.health_check()
+        → Connection Validation
+            → Pool Status Check
+                → Metric Recording
+```
+
+3. Error Handling Flow:
+```
+Error Occurs
+    → Circuit Breaker Update
+        → Metric Recording
+            → Error Propagation
+```
+
+Container-Specific Considerations:
+1. Connection Pool Management:
+   - Pool size based on container resources
+   - Connection cleanup on container shutdown
+   - Health check integration with container orchestration
+
+2. Resource Management:
+   - Memory-aware connection limits
+   - CPU-aware request throttling
+   - Container-aware circuit breaker thresholds
+
+3. Monitoring Integration:
+   - Prometheus metrics export
+   - Container health status
+   - Resource utilization tracking
 
 Next Files to Review:
-1. core/api_handler.py
+1. core/circuit_breaker.py
 2. core/data_processor.py
-3. core/claude/client.py
+3. utils/monitoring.py
 
 Updates Needed:
-1. Update docker-compose.yml with all environment variables
-2. Add environment validation to container startup
-3. Add health check configurations
+1. Implement circuit breaker with container awareness
+2. Add container shutdown hooks
+3. Enhance health check mechanism
