@@ -2,220 +2,202 @@
 
 [Previous sections remain the same...]
 
-## 5. Claude Client Analysis (Continued)
+## 6. Base Metrics Collector Analysis (Continued)
 
-### 5.2 Enhanced Implementation (Continued)
+### 6.4 Container Health Integration (Continued)
 
 ```python
-class ClaudeClient:
-    # [Previous implementation remains...]
+class CollectorHealth:
+    async def check_health(self) -> Dict[str, Any]:
+        return {
+            'collector': self.get_collector_name(),
+            'status': self._get_status(),
+            'metrics': await self._get_metrics(),
+            'resources': await self._get_resource_usage(),
+            'container': {
+                'id': os.getenv('HOSTNAME'),
+                'uptime': self._get_uptime(),
+                'last_collection': self.last_collection_time
+            },
+            'dependencies': {
+                'database': await self._check_db_connection(),
+                'cache': await self._check_cache_connection(),
+                'apis': await self._check_api_availability()
+            }
+        }
 
-    async def process_request(
-        self,
-        context: Dict[str, Any],
-        cache_ttl: Optional[int] = 3600
-    ) -> Dict[str, Any]:
-        """Process request through Claude.ai"""
-        # [Previous implementation remains...]
-
+    async def _check_db_connection(self) -> Dict[str, Any]:
+        """Check database connection health"""
         try:
-            with self.monitor.measure('claude_request'):
-                response = await self.client.messages.create(
-                    model=self.config.CLAUDE_MODEL,
-                    max_tokens=self.config.MAX_TOKENS,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": context['prompt']
-                        }
-                    ],
-                    temperature=context.get('temperature', 0.7)
-                )
-
-                # Record token usage
-                await self.token_manager.record_usage(
-                    response.usage.total_tokens
-                )
-
-                # Process response
-                processed_response = self._process_response(response)
-
-                # Cache if needed
-                if cache_ttl:
-                    await self.cache.set(
-                        cache_key,
-                        processed_response,
-                        cache_ttl
-                    )
-
-                return processed_response
-
+            async with self.connections.get_postgres() as conn:
+                await conn.execute('SELECT 1')
+                return {'status': 'healthy'}
         except Exception as e:
-            await self.circuit_breaker.record_failure('claude')
-            self.monitor.record_metric('claude_errors', 1)
-            raise ClaudeProcessingError(str(e))
+            return {
+                'status': 'unhealthy',
+                'error': str(e)
+            }
+```
 
-class TokenManager:
-    """Manage Claude token usage and quotas"""
+### 6.5 Data Flow Management
+
+```python
+class MetricsDataFlow:
+    """Manage metrics data flow through the system"""
 
     def __init__(self, config: Config):
         self.config = config
-        self.redis = ConnectionManager()
         self.monitor = PerformanceMonitor()
+        self.cache = CacheManager()
 
-    async def check_quota(self) -> None:
-        """Check if token quota is available"""
-        async with self.redis.get() as redis:
-            usage = await redis.get('claude_token_usage')
-            usage = int(usage) if usage else 0
-
-            if usage >= self.config.TOKEN_QUOTA:
-                raise QuotaExceededError('Token quota exceeded')
-
-    async def record_usage(self, tokens: int) -> None:
-        """Record token usage"""
-        async with self.redis.get() as redis:
-            # Increment usage atomically
-            await redis.incrby('claude_token_usage', tokens)
-            
-            # Record metrics
-            self.monitor.record_metric(
-                'token_usage',
-                tokens,
-                {'type': 'incremental'}
-            )
-
-class ResponseCache:
-    """Cache Claude responses"""
-
-    def __init__(self, connections: ConnectionManager):
-        self.redis = connections
-        self.monitor = PerformanceMonitor()
-
-    async def get(self, key: str) -> Optional[Dict[str, Any]]:
-        """Get cached response"""
-        async with self.redis.get() as redis:
-            if cached := await redis.get(f'claude_cache:{key}'):
-                self.monitor.record_metric('cache_hits', 1)
-                return json.loads(cached)
-            self.monitor.record_metric('cache_misses', 1)
-            return None
-
-    async def set(
+    async def process_metrics(
         self,
-        key: str,
-        value: Dict[str, Any],
-        ttl: int
-    ) -> None:
-        """Cache response with TTL"""
-        async with self.redis.get() as redis:
-            await redis.setex(
-                f'claude_cache:{key}',
-                ttl,
-                json.dumps(value)
-            )
+        metrics: Dict[str, Any],
+        collector: str
+    ) -> Dict[str, Any]:
+        """Process metrics through the system"""
+        # 1. Validate incoming data
+        validated = await self._validate_metrics(metrics)
+
+        # 2. Transform for processing
+        transformed = await self._transform_metrics(validated)
+
+        # 3. Enrich with additional data
+        enriched = await self._enrich_metrics(transformed)
+
+        # 4. Cache results
+        await self._cache_metrics(enriched, collector)
+
+        return enriched
+
+    async def _validate_metrics(
+        self,
+        metrics: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Validate metrics data"""
+        with self.monitor.measure('metrics_validation'):
+            schema = self._get_validation_schema()
+            try:
+                return schema.validate(metrics)
+            except ValidationError as e:
+                self.monitor.record_metric('validation_errors', 1)
+                raise
+
+    async def _transform_metrics(
+        self,
+        metrics: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Transform metrics for processing"""
+        with self.monitor.measure('metrics_transformation'):
+            # Apply transformations
+            normalized = self._normalize_values(metrics)
+            formatted = self._format_timestamps(normalized)
+            return self._structure_data(formatted)
+
+    async def _enrich_metrics(
+        self,
+        metrics: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Enrich metrics with additional data"""
+        with self.monitor.measure('metrics_enrichment'):
+            # Add metadata
+            metrics['metadata'] = {
+                'collector': self.get_collector_name(),
+                'timestamp': datetime.utcnow().isoformat(),
+                'version': self.config.VERSION,
+                'container': os.getenv('HOSTNAME')
+            }
+
+            # Add computed fields
+            metrics['computed'] = await self._compute_derived_metrics(metrics)
+
+            return metrics
 ```
 
-### 5.3 Function Chain Analysis
+### 6.6 Container Orchestration Integration
 
-1. Request Processing Flow:
-```
-Client Request
-    → Circuit Breaker Check
-        → Cache Check
-            → Token Quota Check
-                → Claude Processing
-                    → Token Usage Recording
-                        → Cache Update
-                            → Response
-```
-
-2. Token Management Flow:
-```
-Request Processing
-    → check_quota()
-        → Process Request
-            → record_usage()
-                → Metric Recording
+1. Service Discovery:
+```yaml
+# docker-compose.yml additions
+services:
+  collector:
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.collector.rule=Host(`collector.local`)"
+      - "traefik.http.services.collector.loadbalancer.server.port=8000"
 ```
 
-3. Cache Management Flow:
-```
-Request
-    → Cache Check
-        → Cache Hit → Return Cached
-        → Cache Miss → Process New
-            → Cache Update
+2. Resource Configuration:
+```yaml
+# kubernetes manifest example
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metrics-collector
+spec:
+  template:
+    spec:
+      containers:
+      - name: collector
+        resources:
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
 ```
 
-### 5.4 Container-Specific Considerations
+3. Health Probes:
+```yaml
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+```
 
-1. Resource Management:
+### 6.7 Monitoring Integration
+
+1. Metrics Export:
 ```python
-class ResourceConfig:
-    # Container resource limits
-    MAX_CONCURRENT_REQUESTS = int(os.getenv('MAX_CONCURRENT_REQUESTS', '10'))
-    REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', '30'))
-    MAX_RETRIES = int(os.getenv('MAX_RETRIES', '3'))
-    
-    # Token management
-    TOKEN_QUOTA = int(os.getenv('TOKEN_QUOTA', '100000'))
-    QUOTA_RESET_INTERVAL = int(os.getenv('QUOTA_RESET_INTERVAL', '3600'))
-    
-    # Cache configuration
-    CACHE_TTL = int(os.getenv('CACHE_TTL', '3600'))
-    MAX_CACHE_SIZE = int(os.getenv('MAX_CACHE_SIZE', '1000'))
+class CollectorMetrics:
+    def collect(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                'name': 'collector_total_collections',
+                'type': 'counter',
+                'value': self.total_collections,
+                'labels': {'collector': self.get_collector_name()}
+            },
+            {
+                'name': 'collector_processing_time',
+                'type': 'histogram',
+                'value': self.processing_times,
+                'labels': {'collector': self.get_collector_name()}
+            }
+        ]
 ```
 
-2. Health Monitoring:
-```python
-class ClaudeHealth:
-    async def check_health(self) -> Dict[str, Any]:
-        return {
-            'status': 'healthy',
-            'circuit_breaker': await self.circuit_breaker.get_status(),
-            'token_usage': await self.token_manager.get_usage(),
-            'cache_stats': await self.cache.get_stats(),
-            'response_times': self.monitor.get_timings('claude_request')
-        }
+2. Alert Rules:
+```yaml
+groups:
+- name: collector_alerts
+  rules:
+  - alert: CollectorHighErrorRate
+    expr: rate(collector_errors_total[5m]) > 0.1
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      description: "Collector {{ $labels.collector }} has high error rate"
 ```
 
-3. Container Metrics:
-```python
-class ClaudeMetrics:
-    def record_metrics(self, response: Dict[str, Any]):
-        self.monitor.record_metric(
-            'response_tokens',
-            response['usage']['total_tokens']
-        )
-        self.monitor.record_metric(
-            'response_time',
-            response['timing']['total_ms']
-        )
-        self.monitor.record_metric(
-            'concurrent_requests',
-            len(self.active_requests)
-        )
-```
-
-### 5.5 Critical Paths
-
-1. Error Handling:
-   - Network failures
-   - Quota exceeded
-   - Token limits
-   - Timeouts
-
-2. Resource Management:
-   - Concurrent requests
-   - Memory usage
-   - Cache size
-   - Token quotas
-
-3. Performance Optimization:
-   - Request batching
-   - Cache strategies
-   - Token efficiency
-   - Response streaming
-
-Next Component to Review: Metrics Collectors (metrics/base.py)
+Next Section to Review: Market Metrics Collector Implementation
