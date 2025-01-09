@@ -2,212 +2,220 @@
 
 [Previous sections remain the same...]
 
-## 4. Data Processor Analysis
+## 5. Claude Client Analysis (Continued)
 
-### 4.1 core/data_processor.py Review
-
-Current Implementation Issues:
-1. Memory management in containerized environment
-2. No streaming processing
-3. Missing resource awareness
-4. Lack of container-specific optimizations
-
-### 4.2 Enhanced Implementation
+### 5.2 Enhanced Implementation (Continued)
 
 ```python
-from typing import Dict, Any, AsyncIterator
-from utils.monitoring import PerformanceMonitor
-from utils.connections import ConnectionManager
+class ClaudeClient:
+    # [Previous implementation remains...]
 
-class DataProcessor:
-    def __init__(self, config: Config):
-        self.config = config
-        self.connections = ConnectionManager()
-        self.monitor = PerformanceMonitor()
-        self.batch_size = config.PROCESSING_BATCH_SIZE
-        self.max_memory = config.MAX_MEMORY_USAGE
-
-    async def process_stream(
+    async def process_request(
         self,
-        data_stream: AsyncIterator[Dict[str, Any]]
-    ) -> AsyncIterator[Dict[str, Any]]:
-        """Process data in streaming fashion"""
-        current_batch = []
-        memory_usage = 0
+        context: Dict[str, Any],
+        cache_ttl: Optional[int] = 3600
+    ) -> Dict[str, Any]:
+        """Process request through Claude.ai"""
+        # [Previous implementation remains...]
 
-        async for item in data_stream:
-            # Check memory limits
-            item_size = self._estimate_size(item)
-            if memory_usage + item_size > self.max_memory:
-                await self._process_batch(current_batch)
-                current_batch = []
-                memory_usage = 0
-
-            current_batch.append(item)
-            memory_usage += item_size
-
-            if len(current_batch) >= self.batch_size:
-                processed = await self._process_batch(current_batch)
-                for result in processed:
-                    yield result
-                current_batch = []
-                memory_usage = 0
-
-        # Process remaining items
-        if current_batch:
-            processed = await self._process_batch(current_batch)
-            for result in processed:
-                yield result
-
-    async def _process_batch(
-        self,
-        batch: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """Process a batch of data"""
         try:
-            with self.monitor.measure('batch_processing'):
-                # Validate batch
-                valid_data = await self._validate_batch(batch)
+            with self.monitor.measure('claude_request'):
+                response = await self.client.messages.create(
+                    model=self.config.CLAUDE_MODEL,
+                    max_tokens=self.config.MAX_TOKENS,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": context['prompt']
+                        }
+                    ],
+                    temperature=context.get('temperature', 0.7)
+                )
 
-                # Transform data
-                transformed = await self._transform_batch(valid_data)
+                # Record token usage
+                await self.token_manager.record_usage(
+                    response.usage.total_tokens
+                )
 
-                # Store results
-                await self._store_results(transformed)
+                # Process response
+                processed_response = self._process_response(response)
 
-                return transformed
+                # Cache if needed
+                if cache_ttl:
+                    await self.cache.set(
+                        cache_key,
+                        processed_response,
+                        cache_ttl
+                    )
+
+                return processed_response
 
         except Exception as e:
-            self.monitor.record_metric('processing_errors', 1)
-            raise ProcessingError(f'Batch processing failed: {str(e)}')
+            await self.circuit_breaker.record_failure('claude')
+            self.monitor.record_metric('claude_errors', 1)
+            raise ClaudeProcessingError(str(e))
 
-    def _estimate_size(self, item: Dict[str, Any]) -> int:
-        """Estimate memory size of item"""
-        import sys
-        return sys.getsizeof(str(item))  # Simple estimation
+class TokenManager:
+    """Manage Claude token usage and quotas"""
 
-    async def _validate_batch(
+    def __init__(self, config: Config):
+        self.config = config
+        self.redis = ConnectionManager()
+        self.monitor = PerformanceMonitor()
+
+    async def check_quota(self) -> None:
+        """Check if token quota is available"""
+        async with self.redis.get() as redis:
+            usage = await redis.get('claude_token_usage')
+            usage = int(usage) if usage else 0
+
+            if usage >= self.config.TOKEN_QUOTA:
+                raise QuotaExceededError('Token quota exceeded')
+
+    async def record_usage(self, tokens: int) -> None:
+        """Record token usage"""
+        async with self.redis.get() as redis:
+            # Increment usage atomically
+            await redis.incrby('claude_token_usage', tokens)
+            
+            # Record metrics
+            self.monitor.record_metric(
+                'token_usage',
+                tokens,
+                {'type': 'incremental'}
+            )
+
+class ResponseCache:
+    """Cache Claude responses"""
+
+    def __init__(self, connections: ConnectionManager):
+        self.redis = connections
+        self.monitor = PerformanceMonitor()
+
+    async def get(self, key: str) -> Optional[Dict[str, Any]]:
+        """Get cached response"""
+        async with self.redis.get() as redis:
+            if cached := await redis.get(f'claude_cache:{key}'):
+                self.monitor.record_metric('cache_hits', 1)
+                return json.loads(cached)
+            self.monitor.record_metric('cache_misses', 1)
+            return None
+
+    async def set(
         self,
-        batch: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """Validate batch of data"""
-        valid_items = []
-        for item in batch:
-            try:
-                validated = await self._validate_item(item)
-                valid_items.append(validated)
-            except ValidationError as e:
-                self.monitor.record_metric('validation_errors', 1)
-                # Log error but continue processing
-                continue
-        return valid_items
-
-    async def _store_results(
-        self,
-        results: List[Dict[str, Any]]
+        key: str,
+        value: Dict[str, Any],
+        ttl: int
     ) -> None:
-        """Store processed results"""
-        async with self.connections.get_postgres() as conn:
-            # Batch insert
-            await conn.executemany(
-                '''
-                INSERT INTO processed_data (data, created_at)
-                VALUES ($1, NOW())
-                ''',
-                [(json.dumps(r),) for r in results]
+        """Cache response with TTL"""
+        async with self.redis.get() as redis:
+            await redis.setex(
+                f'claude_cache:{key}',
+                ttl,
+                json.dumps(value)
             )
 ```
 
-### 4.3 Function Chain Analysis
+### 5.3 Function Chain Analysis
 
-1. Data Processing Flow:
+1. Request Processing Flow:
 ```
-Input Stream
-    → process_stream()
-        → Memory Check
-            → Batch Collection
-                → _process_batch()
-                    → Results
-```
-
-2. Batch Processing Flow:
-```
-Batch Data
-    → _validate_batch()
-        → _transform_batch()
-            → _store_results()
-                → Results
+Client Request
+    → Circuit Breaker Check
+        → Cache Check
+            → Token Quota Check
+                → Claude Processing
+                    → Token Usage Recording
+                        → Cache Update
+                            → Response
 ```
 
-3. Resource Management Flow:
+2. Token Management Flow:
 ```
-New Data
-    → Memory Estimation
-        → Resource Check
-            → Processing Decision
-                → Memory Release
+Request Processing
+    → check_quota()
+        → Process Request
+            → record_usage()
+                → Metric Recording
 ```
 
-### 4.4 Container-Specific Considerations
+3. Cache Management Flow:
+```
+Request
+    → Cache Check
+        → Cache Hit → Return Cached
+        → Cache Miss → Process New
+            → Cache Update
+```
 
-1. Resource Awareness:
+### 5.4 Container-Specific Considerations
+
+1. Resource Management:
 ```python
-class ResourceMonitor:
-    def __init__(self, config: Config):
-        self.max_memory = config.MAX_MEMORY_USAGE
-        self.max_cpu = config.MAX_CPU_USAGE
-
-    async def check_resources(self) -> bool:
-        """Check if resources are available"""
-        memory_usage = psutil.Process().memory_info().rss
-        cpu_usage = psutil.cpu_percent()
-
-        return (
-            memory_usage < self.max_memory and
-            cpu_usage < self.max_cpu
-        )
+class ResourceConfig:
+    # Container resource limits
+    MAX_CONCURRENT_REQUESTS = int(os.getenv('MAX_CONCURRENT_REQUESTS', '10'))
+    REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', '30'))
+    MAX_RETRIES = int(os.getenv('MAX_RETRIES', '3'))
+    
+    # Token management
+    TOKEN_QUOTA = int(os.getenv('TOKEN_QUOTA', '100000'))
+    QUOTA_RESET_INTERVAL = int(os.getenv('QUOTA_RESET_INTERVAL', '3600'))
+    
+    # Cache configuration
+    CACHE_TTL = int(os.getenv('CACHE_TTL', '3600'))
+    MAX_CACHE_SIZE = int(os.getenv('MAX_CACHE_SIZE', '1000'))
 ```
 
-2. Container Health Integration:
+2. Health Monitoring:
 ```python
-class ProcessorHealth:
+class ClaudeHealth:
     async def check_health(self) -> Dict[str, Any]:
         return {
             'status': 'healthy',
-            'memory_usage': psutil.Process().memory_info().rss,
-            'cpu_usage': psutil.cpu_percent(),
-            'batch_size': self.batch_size,
-            'active_batches': len(self.current_batches)
+            'circuit_breaker': await self.circuit_breaker.get_status(),
+            'token_usage': await self.token_manager.get_usage(),
+            'cache_stats': await self.cache.get_stats(),
+            'response_times': self.monitor.get_timings('claude_request')
         }
 ```
 
-3. Performance Metrics:
+3. Container Metrics:
 ```python
-class ProcessorMetrics:
-    def record_batch_metrics(self, batch_size: int, process_time: float):
-        self.monitor.record_metric('batch_size', batch_size)
-        self.monitor.record_metric('process_time', process_time)
+class ClaudeMetrics:
+    def record_metrics(self, response: Dict[str, Any]):
         self.monitor.record_metric(
-            'items_per_second',
-            batch_size / process_time if process_time > 0 else 0
+            'response_tokens',
+            response['usage']['total_tokens']
+        )
+        self.monitor.record_metric(
+            'response_time',
+            response['timing']['total_ms']
+        )
+        self.monitor.record_metric(
+            'concurrent_requests',
+            len(self.active_requests)
         )
 ```
 
-### 4.5 Critical Components
+### 5.5 Critical Paths
 
-1. Memory Management:
-   - Batch size optimization
-   - Resource monitoring
-   - Garbage collection
+1. Error Handling:
+   - Network failures
+   - Quota exceeded
+   - Token limits
+   - Timeouts
 
-2. Error Handling:
-   - Batch failure recovery
-   - Partial batch processing
-   - Error reporting
+2. Resource Management:
+   - Concurrent requests
+   - Memory usage
+   - Cache size
+   - Token quotas
 
 3. Performance Optimization:
-   - Concurrent processing
-   - Batch size tuning
-   - Resource utilization
+   - Request batching
+   - Cache strategies
+   - Token efficiency
+   - Response streaming
 
-Next Component to Review: Claude Client (core/claude/client.py)
+Next Component to Review: Metrics Collectors (metrics/base.py)
